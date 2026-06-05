@@ -1,0 +1,11 @@
+# FER 项目依赖（建议在 conda 环境 fer 中安装）
+# pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+torch
+torchvision
+opencv-python
+numpy
+pandas
+scikit-learn
+matplotlib
+seaborn
+Pillow
