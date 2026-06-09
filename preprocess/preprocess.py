@@ -7,18 +7,25 @@ preprocess/preprocess.py
    在 DataLoader 取数据时即时执行，无需把处理后的图片另存到磁盘。
 
 2) 摄像头实时推理用的工具函数 preprocess_face()：
-   对一帧 BGR 图像执行完整的经典 DIP 流水线（灰度化 -> Haar 人脸检测 ->
-   直方图均衡 -> 缩放 -> 归一化），输出可直接喂给模型的张量。
+   对一帧 BGR 图像执行完整经典 DIP 流水线（灰度化 -> Haar 人脸检测 ->
+   CLAHE 自适应均衡 -> 缩放 -> 归一化），输出可直接喂给模型的张量。
 
-DIP 原理对照：
+DIP 原理对照（每一步都能讲出"为什么"）：
 - 灰度化（cvtColor）：去除颜色冗余，表情信息主要体现在亮度/纹理。
-- 直方图均衡（equalizeHist）：拉伸灰度分布、增强对比度，缓解光照不均。
-- Haar 级联人脸检测：基于 Haar-like 特征 + 积分图 + AdaBoost 的经典目标检测。
+- CLAHE（限制对比度的自适应直方图均衡）：把图像分成小块分别做直方图均衡，
+  并对对比度设上限裁剪——相比全局 equalizeHist，它在增强局部对比的同时
+  **不会过度放大平坦区域的噪声**，对人脸光照不均更稳健（可解释的升级）。
+- Haar 级联人脸检测：Haar-like 特征 + 积分图 + AdaBoost 的经典目标检测。
 - 缩放（resize）：统一到网络输入尺寸 48×48（重采样）。
 - 归一化（/255）：把像素从 0–255 映射到 0–1，利于网络训练数值稳定。
 
+【训练增强·可解释】在翻转/小角度旋转之外新增两项 FER2013 上公认有效的增强：
+- RandomResizedCrop：随机缩放裁剪，模拟人脸尺度/位置抖动，提升尺度鲁棒性。
+- RandomErasing（Cutout）：随机遮挡一小块，强迫网络不依赖单一局部线索，
+  对"墨镜/口罩/手遮挡"等真实遮挡更鲁棒，是涨点最明显的增强之一。
+
 注意：本项目数据集图片已是 48×48 灰度裁剪人脸，故数据集路径上
-      「灰度化/人脸检测/缩放」基本是空操作；Haar 检测只在摄像头帧上才真正需要。
+      「灰度化/人脸检测」基本是空操作；Haar 检测只在摄像头帧上才真正需要。
 """
 
 import os
@@ -35,38 +42,114 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 网络输入尺寸
 IMG_SIZE = 48
 
+# 摄像头路径复用的 CLAHE 实例（clipLimit 限制对比度上限，tileGridSize 为分块数）
+_CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+
+# --------------------------------------------------------------------------- #
+# 自定义对比度增强 transform
+# --------------------------------------------------------------------------- #
+class EqualizeHist:
+    """全局直方图均衡（保留作对照/可选项）。"""
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        arr = np.array(img)
+        arr = cv2.equalizeHist(arr)
+        return Image.fromarray(arr)
+
+
+class CLAHETransform:
+    """
+    CLAHE 自适应均衡：分块均衡 + 对比度裁剪，抗噪优于全局均衡。
+
+    注意：cv2.CLAHE 句柄不可被 pickle，而 Windows 的 DataLoader（spawn 多进程）
+    会序列化整个 transform。故这里**只保存参数**，CLAHE 句柄按需惰性创建，
+    并在 __getstate__ 里排除，保证跨进程可序列化。
+    """
+
+    def __init__(self, clip_limit: float = 2.0, tile: int = 8):
+        self.clip_limit = clip_limit
+        self.tile = tile
+        self._clahe = None
+
+    def _engine(self):
+        if self._clahe is None:
+            self._clahe = cv2.createCLAHE(clipLimit=self.clip_limit,
+                                          tileGridSize=(self.tile, self.tile))
+        return self._clahe
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        arr = np.array(img)                 # PIL(L) -> np.uint8 [H, W]
+        arr = self._engine().apply(arr)
+        return Image.fromarray(arr)
+
+    def __getstate__(self):                 # 只序列化参数，丢弃不可 pickle 的句柄
+        return {"clip_limit": self.clip_limit, "tile": self.tile}
+
+    def __setstate__(self, state):
+        self.clip_limit = state["clip_limit"]
+        self.tile = state["tile"]
+        self._clahe = None
+
+
+def _contrast_transform(use_clahe: bool):
+    """对比度增强算子选择：默认 CLAHE，可退回全局均衡做对照实验。"""
+    return CLAHETransform() if use_clahe else EqualizeHist()
+
+
+class _StackCropsToTensor:
+    """把 TenCrop 产生的 10 个 PIL crop 堆叠成 [10, C, H, W] 张量（可 pickle，替代 lambda）。"""
+
+    def __init__(self):
+        self.to_tensor = transforms.ToTensor()
+
+    def __call__(self, crops):
+        return torch.stack([self.to_tensor(c) for c in crops])
+
 
 # --------------------------------------------------------------------------- #
 # 1) 在线变换（数据集路径）
 # --------------------------------------------------------------------------- #
-class EqualizeHist:
-    """自定义 transform：对单通道 PIL 图做直方图均衡（增强对比度）。"""
-
-    def __call__(self, img: Image.Image) -> Image.Image:
-        arr = np.array(img)                 # PIL(L) -> np.uint8 [H, W]
-        arr = cv2.equalizeHist(arr)         # 直方图均衡
-        return Image.fromarray(arr)
-
-
-def get_train_transform(img_size: int = IMG_SIZE) -> transforms.Compose:
-    """训练集变换：含数据增强（随机水平翻转、±10° 旋转）。"""
+def get_train_transform(img_size: int = IMG_SIZE,
+                        use_clahe: bool = True) -> transforms.Compose:
+    """训练集变换：含数据增强（随机裁剪、翻转、±10° 旋转、随机遮挡）。"""
     return transforms.Compose([
-        transforms.Grayscale(num_output_channels=1),  # 确保单通道
-        EqualizeHist(),                               # 直方图均衡
-        transforms.RandomHorizontalFlip(p=0.5),       # 数据增强：左右翻转
-        transforms.RandomRotation(degrees=10),        # 数据增强：±10° 旋转
-        transforms.Resize((img_size, img_size)),      # 统一尺寸
-        transforms.ToTensor(),                        # [0,255] -> [0,1]，并转 CHW 张量
+        transforms.Grayscale(num_output_channels=1),       # 确保单通道
+        _contrast_transform(use_clahe),                    # CLAHE / 全局均衡
+        transforms.RandomResizedCrop(img_size, scale=(0.8, 1.0),
+                                     ratio=(0.9, 1.1)),     # 随机缩放裁剪
+        transforms.RandomHorizontalFlip(p=0.5),            # 左右翻转
+        transforms.RandomRotation(degrees=10),             # ±10° 旋转
+        transforms.ToTensor(),                             # [0,255]->[0,1]，转 CHW
+        transforms.RandomErasing(p=0.5, scale=(0.02, 0.2)),  # Cutout 随机遮挡
     ])
 
 
-def get_eval_transform(img_size: int = IMG_SIZE) -> transforms.Compose:
-    """评估/验证集变换：无数据增强，保证结果可复现。"""
+def get_eval_transform(img_size: int = IMG_SIZE,
+                       use_clahe: bool = True) -> transforms.Compose:
+    """评估/验证集变换：无随机增强，保证结果可复现。"""
     return transforms.Compose([
         transforms.Grayscale(num_output_channels=1),
-        EqualizeHist(),
+        _contrast_transform(use_clahe),
         transforms.Resize((img_size, img_size)),
         transforms.ToTensor(),
+    ])
+
+
+def get_tta_transform(img_size: int = IMG_SIZE,
+                      use_clahe: bool = True) -> transforms.Compose:
+    """
+    Ten-Crop 测试增强（TTA）变换：先放大再裁出 4 角+中心及其翻转共 10 个 crop。
+    可解释：同一张脸用 10 个视角分别预测再平均，等价于一次"小型集成"，降低单视角偏差。
+    返回的张量形状为 [10, 1, img_size, img_size]。
+    """
+    bigger = int(round(img_size * 1.15))
+    return transforms.Compose([
+        transforms.Grayscale(num_output_channels=1),
+        _contrast_transform(use_clahe),
+        transforms.Resize((bigger, bigger)),
+        transforms.TenCrop(img_size),
+        _StackCropsToTensor(),
     ])
 
 
@@ -103,7 +186,7 @@ def preprocess_face(frame_bgr: np.ndarray, cascade: cv2.CascadeClassifier,
     results = []
     for (x, y, w, h) in faces:
         roi = gray[y:y + h, x:x + w]        # 裁剪人脸区域
-        roi = cv2.equalizeHist(roi)         # 直方图均衡，增强对比度
+        roi = _CLAHE.apply(roi)             # CLAHE 自适应均衡（抗光照不均、少放大噪声）
         roi = cv2.resize(roi, (size, size)) # 缩放到网络输入尺寸
         roi = roi.astype(np.float32) / 255.0  # 归一化到 [0,1]
         tensor = torch.from_numpy(roi).unsqueeze(0).unsqueeze(0)  # -> [1,1,H,W]
@@ -112,7 +195,7 @@ def preprocess_face(frame_bgr: np.ndarray, cascade: cv2.CascadeClassifier,
 
 
 # --------------------------------------------------------------------------- #
-# 独立运行：演示直方图均衡效果 + 统计各类样本数
+# 独立运行：演示 CLAHE 效果 + 统计各类样本数
 # --------------------------------------------------------------------------- #
 def _count_dataset(split_dir: str):
     """统计某个 split（train/test）下各类别的样本数。"""
@@ -149,7 +232,7 @@ if __name__ == "__main__":
         print(f"  {cls:<10}: {n}")
     print(f"  合计: {sum(test_counts.values())}")
 
-    # 找一张样本图，演示「直方图均衡前/后」对比
+    # 找一张样本图，演示「全局均衡 vs CLAHE」对比
     sample_path = None
     for cls in (train_counts or {}):
         cls_dir = os.path.join(train_dir, cls)
@@ -162,14 +245,18 @@ if __name__ == "__main__":
     if sample_path:
         gray = cv2.imread(sample_path, cv2.IMREAD_GRAYSCALE)
         equalized = cv2.equalizeHist(gray)
+        clahe_img = _CLAHE.apply(gray)
 
-        fig, axes = plt.subplots(2, 2, figsize=(8, 8))
-        axes[0, 0].imshow(gray, cmap="gray");      axes[0, 0].set_title("Original")
-        axes[0, 1].imshow(equalized, cmap="gray"); axes[0, 1].set_title("Equalized")
+        fig, axes = plt.subplots(2, 3, figsize=(12, 8))
+        axes[0, 0].imshow(gray, cmap="gray");       axes[0, 0].set_title("Original")
+        axes[0, 1].imshow(equalized, cmap="gray");  axes[0, 1].set_title("Global equalizeHist")
+        axes[0, 2].imshow(clahe_img, cmap="gray");  axes[0, 2].set_title("CLAHE (used)")
         axes[1, 0].hist(gray.ravel(), bins=256, range=(0, 255))
         axes[1, 0].set_title("Original histogram")
         axes[1, 1].hist(equalized.ravel(), bins=256, range=(0, 255))
-        axes[1, 1].set_title("Equalized histogram")
+        axes[1, 1].set_title("Global eq. histogram")
+        axes[1, 2].hist(clahe_img.ravel(), bins=256, range=(0, 255))
+        axes[1, 2].set_title("CLAHE histogram")
         for ax in axes[0]:
             ax.axis("off")
         plt.tight_layout()
@@ -177,6 +264,6 @@ if __name__ == "__main__":
         out_path = os.path.join(_REPO_ROOT, "checkpoints", "equalize_demo.png")
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         plt.savefig(out_path, dpi=120)
-        print(f"\n直方图均衡对比图已保存: {out_path}")
+        print(f"\n对比度增强对比图（原图/全局均衡/CLAHE）已保存: {out_path}")
     else:
         print("\n未找到样本图，跳过可视化。")
