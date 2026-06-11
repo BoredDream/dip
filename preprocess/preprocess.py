@@ -183,11 +183,24 @@ def preprocess_face(frame_bgr: np.ndarray, cascade: cv2.CascadeClassifier,
     faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5,
                                      minSize=(48, 48))
 
+    frame_h, frame_w = gray.shape[:2]
     results = []
     for (x, y, w, h) in faces:
+        # Haar 框 -> FER2013 式取景：实测标定（把 FER2013 紧裁剪图放大后让 Haar
+        # 检测，247 张 happy 样本上 Haar 框平均只覆盖原图 (x=0.089, y=0.098,
+        # w=h=0.795) 的中央区域，即眉毛/下巴/嘴角被切掉一圈）。这里按该均值
+        # 反向外扩，使送入网络的取景与训练数据一致，否则 happy 等依赖嘴部
+        # 线索的类别召回明显下降。
+        x = max(0, int(round(x - 0.112 * w)))
+        y = max(0, int(round(y - 0.123 * h)))
+        w = min(frame_w - x, int(round(w / 0.795)))
+        h = min(frame_h - y, int(round(h / 0.795)))
         roi = gray[y:y + h, x:x + w]        # 裁剪人脸区域
-        roi = _CLAHE.apply(roi)             # CLAHE 自适应均衡（抗光照不均、少放大噪声）
+        # 先缩放再 CLAHE：训练数据本身就是 48×48，CLAHE 的 8×8 分块在 48×48 上
+        # 每块仅 6×6 像素；若在高分辨率 ROI 上先做均衡再缩放，纹理统计与训练分布
+        # 不一致（domain shift），模型会大概率退回 neutral
         roi = cv2.resize(roi, (size, size)) # 缩放到网络输入尺寸
+        roi = _CLAHE.apply(roi)             # CLAHE 自适应均衡（与训练同尺度）
         roi = roi.astype(np.float32) / 255.0  # 归一化到 [0,1]
         tensor = torch.from_numpy(roi).unsqueeze(0).unsqueeze(0)  # -> [1,1,H,W]
         results.append((tensor, (int(x), int(y), int(w), int(h))))
